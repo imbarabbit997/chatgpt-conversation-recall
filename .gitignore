@@ -1,0 +1,8 @@
+node_modules/
+*.crx
+*.pem
+*.zip
+chatgpt-*备份*.json
+.DS_Store
+Thumbs.db
+Desktop.ini
