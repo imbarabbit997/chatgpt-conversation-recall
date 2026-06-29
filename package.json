@@ -1,11 +1,11 @@
 {
   "name": "chatgpt-conversation-recall",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "private": true,
   "description": "A local-first Edge and Chrome extension that remembers and searches ChatGPT conversations you have opened.",
   "scripts": {
-    "test": "node tests/search-core.test.js",
-    "check": "node --check background.js && node --check search-core.js && node --check content.js && npm test"
+    "test": "node tests/archive-core.test.js && node tests/search-core.test.js",
+    "check": "node --check background.js && node --check archive-core.js && node --check search-core.js && node --check content.js && npm test"
   },
   "keywords": [
     "chatgpt",

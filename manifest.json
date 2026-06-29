@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT 对话寻踪",
-  "version": "1.1.0",
-  "description": "实时索引你在 ChatGPT 网页中实际打开的对话，并在本地快速搜索。",
+  "version": "2.0.0",
+  "description": "增量保存、完整扫描并搜索你在 ChatGPT 网页中实际打开的对话。",
   "permissions": [
     "storage",
     "unlimitedStorage"
@@ -22,6 +22,7 @@
         "https://chatgpt.com/*"
       ],
       "js": [
+        "archive-core.js",
         "search-core.js",
         "content.js"
       ],

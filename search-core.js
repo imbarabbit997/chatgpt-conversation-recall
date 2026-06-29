@@ -54,9 +54,12 @@
 
     for (const conversation of conversations) {
       const normalizedTitle = normalizeText(conversation.title);
+      const messages = Array.isArray(conversation.messages)
+        ? conversation.messages
+        : (conversation.segments || []).flatMap((segment) => segment.messages || []);
 
-      for (let index = 0; index < conversation.messages.length; index += 1) {
-        const message = conversation.messages[index];
+      for (let index = 0; index < messages.length; index += 1) {
+        const message = messages[index];
         const normalizedBody = normalizeText(message.text);
         const combined = `${normalizedTitle} ${normalizedBody}`;
 
@@ -78,7 +81,12 @@
           updatedAt: conversation.updatedAt,
           role: message.role,
           messageId: message.id,
+          stableId: message.stableId || null,
           messageIndex: index,
+          messageCount: messages.length,
+          captureStatus: conversation.capture?.status || "partial",
+          completedAt: conversation.capture?.completedAt || null,
+          hasGaps: Boolean(conversation.capture?.hasGaps),
           snippet: createSnippet(message.text, tokens),
           score
         });
