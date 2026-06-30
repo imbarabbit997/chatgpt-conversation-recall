@@ -10,3 +10,30 @@ chrome.action.onClicked.addListener(async (tab) => {
     // after the page settles will open the panel.
   }
 });
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type !== "CHAT_RECALL_DOWNLOAD") return false;
+
+  const run = async () => {
+    const bytes = new TextEncoder().encode(String(message.content || ""));
+    let binary = "";
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    const url = `data:${message.mime || "text/plain;charset=utf-8"};base64,${btoa(binary)}`;
+    const downloadId = await chrome.downloads.download({
+      url,
+      filename: message.filename || "chatgpt-conversation-export.txt",
+      saveAs: true,
+      conflictAction: "uniquify"
+    });
+    return { ok: true, downloadId };
+  };
+
+  run()
+    .then((result) => sendResponse(result))
+    .catch((error) => sendResponse({
+      ok: false,
+      error: error?.message || String(error)
+    }));
+
+  return true;
+});

@@ -12,6 +12,7 @@
   const MAX_RESULTS = 80;
   const archive = globalThis.ChatRecallArchive;
   const searchCore = globalThis.ChatRecallCore;
+  const exportCore = globalThis.ChatRecallExport;
 
   const state = {
     conversations: new Map(),
@@ -24,6 +25,11 @@
     activeView: "search",
     filterStatus: "all",
     lastResults: [],
+    exportDialog: {
+      open: false,
+      format: "markdown",
+      selectedIds: new Set()
+    },
     capture: null,
     persistChain: Promise.resolve()
   };
@@ -295,6 +301,142 @@
     return true;
   }
 
+  function sortedConversations() {
+    const priority = { gapped: 0, stale: 1, paused: 2, partial: 3, scanning: 4, complete: 5 };
+    return [...state.conversations.values()]
+      .sort((left, right) => {
+        const statusDifference = (priority[left.capture?.status] ?? 3)
+          - (priority[right.capture?.status] ?? 3);
+        return statusDifference || right.updatedAt - left.updatedAt;
+      });
+  }
+
+  function getSelectedExportConversations() {
+    return [...state.exportDialog.selectedIds]
+      .map((id) => state.conversations.get(id))
+      .filter(Boolean);
+  }
+
+  function exportStatusSummary(conversation) {
+    const meta = statusMeta(conversation.capture?.status);
+    const count = archive.getMessageCount(conversation);
+    const complete = exportCore.isComplete(conversation);
+    if (complete) return `${meta.symbol} 已完整保存 · ${count} 条`;
+    if (conversation.capture?.hasGaps) return `${meta.symbol} 存在顺序缺口 · ${count} 条`;
+    return `${meta.symbol} ${meta.label} · ${count} 条`;
+  }
+
+  function openExportDialog(ids = []) {
+    const candidates = ids.filter((id) => state.conversations.has(id));
+    const currentId = getConversationId();
+    const selected = candidates.length
+      ? candidates
+      : currentId && state.conversations.has(currentId)
+        ? [currentId]
+        : [];
+    state.exportDialog.open = true;
+    state.exportDialog.selectedIds = new Set(selected);
+    renderExportDialog();
+  }
+
+  function closeExportDialog() {
+    state.exportDialog.open = false;
+    ui.exportModal.dataset.show = "false";
+  }
+
+  function renderExportDialog() {
+    if (!ui.exportModal) return;
+    ui.exportModal.dataset.show = String(state.exportDialog.open);
+    if (!state.exportDialog.open) return;
+
+    const conversations = sortedConversations();
+    const selected = getSelectedExportConversations();
+    const incomplete = selected.filter((conversation) => !exportCore.isComplete(conversation)).length;
+    const selectedMessages = selected.reduce((sum, conversation) => sum + archive.getMessageCount(conversation), 0);
+
+    ui.exportList.innerHTML = conversations.length
+      ? conversations.map((conversation) => {
+        const checked = state.exportDialog.selectedIds.has(conversation.id) ? "checked" : "";
+        const meta = statusMeta(conversation.capture?.status);
+        return `
+          <label class="cr-export-row">
+            <input type="checkbox" value="${escapeHtml(conversation.id)}" ${checked} />
+            <span>
+              <strong>${escapeHtml(conversation.title)}</strong>
+              <small><span class="cr-status-pill cr-tone-${meta.tone}">${escapeHtml(exportStatusSummary(conversation))}</span></small>
+            </span>
+          </label>`;
+      }).join("")
+      : `<div class="cr-empty cr-export-empty"><div><strong>还没有可导出的对话</strong><span>先打开或完整收录一段 ChatGPT 对话。</span></div></div>`;
+
+    ui.exportFormatButtons.forEach((button) => {
+      button.dataset.active = String(button.dataset.format === state.exportDialog.format);
+    });
+    ui.exportConfirm.disabled = selected.length === 0;
+    ui.exportSummary.textContent = selected.length
+      ? `将导出 ${selected.length} 段对话、${selectedMessages} 条消息。`
+      : "请选择至少一段对话。";
+    ui.exportWarning.hidden = incomplete === 0;
+    ui.exportWarning.textContent = incomplete
+      ? `其中 ${incomplete} 段尚未完整保存，导出内容可能缺少未加载过的消息。`
+      : "";
+  }
+
+  function sendDownload(payload) {
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({
+        type: "CHAT_RECALL_DOWNLOAD",
+        filename: payload.filename,
+        mime: payload.mime,
+        content: payload.content
+      }, (response) => {
+        const error = chrome.runtime.lastError;
+        if (error) {
+          reject(error);
+          return;
+        }
+        if (response?.ok) resolve(response);
+        else reject(new Error(response?.error || "下载失败"));
+      });
+    });
+  }
+
+  async function copyExportToClipboard(content) {
+    await navigator.clipboard.writeText(content);
+    showToast("下载未完成，已将导出内容复制到剪贴板");
+  }
+
+  async function exportSelectedConversations() {
+    const conversations = getSelectedExportConversations();
+    if (!conversations.length) {
+      showToast("请选择要导出的对话");
+      return;
+    }
+
+    const payload = exportCore.exportConversations(conversations, {
+      format: state.exportDialog.format,
+      archive,
+      generatedAt: Date.now()
+    });
+
+    ui.exportConfirm.disabled = true;
+    ui.exportConfirm.textContent = "正在打开保存窗口…";
+    try {
+      await sendDownload(payload);
+      closeExportDialog();
+      showToast(`已导出 ${payload.conversationCount} 段对话 · ${payload.messageCount} 条消息`);
+    } catch {
+      try {
+        await copyExportToClipboard(payload.content);
+      } catch {
+        showToast("导出失败：请检查下载权限，或重新加载扩展后再试");
+      }
+    } finally {
+      ui.exportConfirm.textContent = "导出";
+      ui.exportConfirm.disabled = false;
+    }
+  }
+
   function render() {
     if (!ui.results) return;
     const stats = getStats();
@@ -332,6 +474,7 @@
         ? "继续完整扫描"
         : "扫描并完整保存";
     ui.scanCurrent.disabled = Boolean(state.capture?.active);
+    ui.exportCurrent.disabled = !conversation;
   }
 
   function renderPageStatus() {
@@ -404,19 +547,16 @@
             <p class="cr-result-title">${highlight(result.title, query)}</p>
             <p class="cr-snippet">${highlight(result.snippet, query)}</p>
           </button>
-          <button class="cr-result-locate" type="button" data-locate-index="${index}">在 ChatGPT 中定位</button>
+          <div class="cr-result-actions">
+            <button type="button" data-export-conversation="${escapeHtml(result.conversationId)}">导出</button>
+            <button class="cr-result-locate" type="button" data-locate-index="${index}">在 ChatGPT 中定位</button>
+          </div>
         </article>`;
     }).join("");
   }
 
   function renderLibrary() {
-    const priority = { gapped: 0, stale: 1, paused: 2, partial: 3, scanning: 4, complete: 5 };
-    const conversations = [...state.conversations.values()]
-      .sort((left, right) => {
-        const statusDifference = (priority[left.capture?.status] ?? 3)
-          - (priority[right.capture?.status] ?? 3);
-        return statusDifference || right.updatedAt - left.updatedAt;
-      });
+    const conversations = sortedConversations();
 
     if (!conversations.length) {
       ui.results.innerHTML = `
@@ -443,6 +583,7 @@
           <p>${escapeHtml(detail)}</p>
           <div class="cr-library-actions">
             <button type="button" data-open-conversation="${escapeHtml(conversation.id)}">打开对话</button>
+            <button type="button" data-export-conversation="${escapeHtml(conversation.id)}">导出</button>
             ${conversation.id === currentId
               ? `<button class="cr-primary-link" type="button" data-scan-conversation="${escapeHtml(conversation.id)}">${conversation.capture?.status === "complete" ? "重新校验" : "完整扫描"}</button>`
               : ""}
@@ -975,7 +1116,10 @@
           <strong class="cr-current-title"></strong>
           <span class="cr-current-state cr-status-pill"></span>
         </div>
-        <button class="cr-scan-current" type="button">扫描并完整保存</button>
+        <div class="cr-current-actions">
+          <button class="cr-export-current" type="button">导出</button>
+          <button class="cr-scan-current" type="button">扫描并完整保存</button>
+        </div>
       </section>
       <section class="cr-search-section">
         <div class="cr-search-wrap">
@@ -998,7 +1142,8 @@
       <footer class="cr-footer">
         <span class="cr-footer-stats">0 段对话 · 0 条消息</span>
         <div class="cr-footer-actions">
-          <button class="cr-footer-button cr-export" type="button">备份</button>
+          <button class="cr-footer-button cr-export" type="button">导出</button>
+          <button class="cr-footer-button cr-backup" type="button">备份</button>
           <button class="cr-footer-button cr-import" type="button">恢复</button>
           <button class="cr-footer-button cr-clear" type="button">清空</button>
         </div>
@@ -1034,6 +1179,37 @@
         </div>
       </div>
     </div>
+    <div class="cr-modal cr-export-modal" data-show="false">
+      <div class="cr-modal-card cr-export-card" role="dialog" aria-modal="true" aria-labelledby="cr-export-title">
+        <button class="cr-export-close cr-icon-button" type="button" aria-label="关闭">✕</button>
+        <p class="cr-eyebrow">EXPORT FOR READING</p>
+        <h2 id="cr-export-title">导出已收录对话</h2>
+        <p>选择要导出的对话和格式。浏览器会打开“另存为”窗口，让你决定文件名和保存位置。</p>
+        <div class="cr-export-section">
+          <h3>1. 选择对话</h3>
+          <div class="cr-export-list"></div>
+        </div>
+        <div class="cr-export-section">
+          <h3>2. 选择格式</h3>
+          <div class="cr-export-formats">
+            <button type="button" data-format="markdown" data-active="true">
+              <strong>Markdown</strong>
+              <span>适合 Obsidian、Typora、Notion、GitHub 和长期归档。</span>
+            </button>
+            <button type="button" data-format="txt" data-active="false">
+              <strong>TXT</strong>
+              <span>纯文本，最兼容，适合备份或复制到其他工具。</span>
+            </button>
+          </div>
+        </div>
+        <div class="cr-export-summary"></div>
+        <div class="cr-export-warning" hidden></div>
+        <div class="cr-modal-actions">
+          <button class="cr-export-cancel" type="button">取消</button>
+          <button class="cr-export-confirm cr-primary-button" type="button">导出</button>
+        </div>
+      </div>
+    </div>
     <div class="cr-modal cr-viewer" data-show="false">
       <div class="cr-modal-card cr-viewer-card" role="dialog" aria-modal="true">
         <button class="cr-viewer-close cr-icon-button" type="button" aria-label="关闭">✕</button>
@@ -1056,6 +1232,7 @@
     currentCard: root.querySelector(".cr-current-card"),
     currentTitle: root.querySelector(".cr-current-title"),
     currentState: root.querySelector(".cr-current-state"),
+    exportCurrent: root.querySelector(".cr-export-current"),
     scanCurrent: root.querySelector(".cr-scan-current"),
     searchSection: root.querySelector(".cr-search-section"),
     search: root.querySelector(".cr-search"),
@@ -1064,6 +1241,7 @@
     results: root.querySelector(".cr-results"),
     footerStats: root.querySelector(".cr-footer-stats"),
     export: root.querySelector(".cr-export"),
+    backup: root.querySelector(".cr-backup"),
     import: root.querySelector(".cr-import"),
     clear: root.querySelector(".cr-clear"),
     fileInput: root.querySelector(".cr-file-input"),
@@ -1081,6 +1259,14 @@
     captureConfirm: root.querySelector(".cr-capture-confirm"),
     confirmCancel: root.querySelector(".cr-confirm-cancel"),
     confirmStart: root.querySelector(".cr-confirm-start"),
+    exportModal: root.querySelector(".cr-export-modal"),
+    exportClose: root.querySelector(".cr-export-close"),
+    exportCancel: root.querySelector(".cr-export-cancel"),
+    exportConfirm: root.querySelector(".cr-export-confirm"),
+    exportList: root.querySelector(".cr-export-list"),
+    exportSummary: root.querySelector(".cr-export-summary"),
+    exportWarning: root.querySelector(".cr-export-warning"),
+    exportFormatButtons: [...root.querySelectorAll(".cr-export-formats [data-format]")],
     viewer: root.querySelector(".cr-viewer"),
     viewerClose: root.querySelector(".cr-viewer-close"),
     viewerTitle: root.querySelector(".cr-viewer-title"),
@@ -1105,9 +1291,27 @@
     state.filterStatus = button.dataset.filter;
     render();
   }));
+  ui.exportCurrent.addEventListener("click", () => {
+    const id = getConversationId();
+    if (id) openExportDialog([id]);
+  });
   ui.scanCurrent.addEventListener("click", openCaptureConfirm);
   ui.confirmCancel.addEventListener("click", closeCaptureConfirm);
   ui.confirmStart.addEventListener("click", startFullCapture);
+  ui.exportClose.addEventListener("click", closeExportDialog);
+  ui.exportCancel.addEventListener("click", closeExportDialog);
+  ui.exportConfirm.addEventListener("click", exportSelectedConversations);
+  ui.exportFormatButtons.forEach((button) => button.addEventListener("click", () => {
+    state.exportDialog.format = button.dataset.format;
+    renderExportDialog();
+  }));
+  ui.exportList.addEventListener("change", (event) => {
+    const input = event.target.closest('input[type="checkbox"]');
+    if (!input) return;
+    if (input.checked) state.exportDialog.selectedIds.add(input.value);
+    else state.exportDialog.selectedIds.delete(input.value);
+    renderExportDialog();
+  });
   ui.hudPause.addEventListener("click", () => {
     if (state.capture?.paused) resumeFullCapture();
     else pauseFullCapture("由用户暂停，可随时继续");
@@ -1137,6 +1341,7 @@
     const locate = event.target.closest("[data-locate-index]");
     const openConversation = event.target.closest("[data-open-conversation]");
     const scanConversation = event.target.closest("[data-scan-conversation]");
+    const exportConversation = event.target.closest("[data-export-conversation]");
     if (preview) showLocalPreview(state.lastResults[Number(preview.dataset.previewIndex)]);
     if (locate) openResult(state.lastResults[Number(locate.dataset.locateIndex)]);
     if (openConversation) {
@@ -1144,8 +1349,10 @@
       if (conversation) location.assign(conversation.url);
     }
     if (scanConversation) openCaptureConfirm();
+    if (exportConversation) openExportDialog([exportConversation.dataset.exportConversation]);
   });
-  ui.export.addEventListener("click", exportBackup);
+  ui.export.addEventListener("click", () => openExportDialog());
+  ui.backup.addEventListener("click", exportBackup);
   ui.import.addEventListener("click", () => ui.fileInput.click());
   ui.fileInput.addEventListener("change", async () => {
     const [file] = ui.fileInput.files || [];
@@ -1159,6 +1366,14 @@
       event.preventDefault();
       event.stopPropagation();
       setPanelOpen(!state.panelOpen);
+      return;
+    }
+    if (event.key === "Escape" && state.exportDialog.open) {
+      closeExportDialog();
+      return;
+    }
+    if (event.key === "Escape" && ui.viewer.dataset.show === "true") {
+      closeLocalPreview();
       return;
     }
     if (event.key === "Escape" && state.panelOpen) setPanelOpen(false);
