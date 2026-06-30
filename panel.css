@@ -562,7 +562,8 @@ input {
   font-weight: 700;
 }
 
-.cr-scan-hud {
+.cr-scan-hud,
+.cr-locate-hud {
   position: fixed;
   z-index: 2147483647;
   top: 18px;
@@ -579,20 +580,30 @@ input {
   transition: opacity 160ms ease, transform 180ms ease;
 }
 
-.cr-scan-hud[data-show="true"] {
+.cr-locate-hud {
+  top: auto;
+  bottom: 18px;
+}
+
+.cr-scan-hud[data-show="true"],
+.cr-locate-hud[data-show="true"] {
   opacity: 1;
   transform: translateY(0);
   pointer-events: auto;
 }
 
-.cr-scan-hud[data-outcome="complete"] {
+.cr-scan-hud[data-outcome="complete"],
+.cr-locate-hud[data-outcome="complete"] {
   border-color: rgba(23, 107, 77, 0.42);
   box-shadow: 0 18px 55px rgba(23, 107, 77, 0.22);
 }
 
 .cr-scan-hud[data-outcome="incomplete"],
 .cr-scan-hud[data-outcome="paused"],
-.cr-scan-hud[data-outcome="error"] {
+.cr-scan-hud[data-outcome="error"],
+.cr-locate-hud[data-outcome="incomplete"],
+.cr-locate-hud[data-outcome="paused"],
+.cr-locate-hud[data-outcome="error"] {
   border-color: rgba(197, 138, 45, 0.45);
 }
 
@@ -604,7 +615,8 @@ input {
   letter-spacing: 0.12em;
 }
 
-.cr-hud-title {
+.cr-hud-title,
+.cr-locate-title {
   display: block;
   overflow: hidden;
   color: var(--cr-muted);
@@ -613,13 +625,15 @@ input {
   white-space: nowrap;
 }
 
-.cr-hud-phase {
+.cr-hud-phase,
+.cr-locate-phase {
   margin: 13px 0 4px;
   font-family: Georgia, "Noto Serif SC", serif;
   font-size: 18px;
 }
 
-.cr-hud-note {
+.cr-hud-note,
+.cr-locate-note {
   margin: 0;
   color: var(--cr-muted);
   font-size: 11px;
@@ -650,6 +664,30 @@ input {
   margin: 3px 0 0;
   font-size: 15px;
   font-weight: 750;
+}
+
+.cr-locate-speed-picker {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 5px;
+  margin: -2px 0 12px;
+}
+
+.cr-locate-speed-picker button {
+  padding: 6px 0;
+  border: 1px solid var(--cr-line);
+  border-radius: 7px;
+  color: var(--cr-muted);
+  background: rgba(255, 254, 250, 0.62);
+  cursor: pointer;
+  font-size: 10px;
+}
+
+.cr-locate-speed-picker button[data-active="true"] {
+  border-color: rgba(23, 107, 77, 0.35);
+  color: var(--cr-green);
+  background: var(--cr-green-soft);
+  font-weight: 800;
 }
 
 .cr-hud-actions {

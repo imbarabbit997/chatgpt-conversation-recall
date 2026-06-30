@@ -10,6 +10,14 @@
   const BACKUP_FORMAT = "chatgpt-conversation-recall";
   const BACKUP_VERSION = 2;
   const MAX_RESULTS = 80;
+  const LOCATE_SPEED_KEY = "locateSpeed";
+  const LOCATE_SPEEDS = {
+    slow: { label: "慢速", delay: 900 },
+    normal: { label: "标准", delay: 720 },
+    fast: { label: "快速", delay: 360 },
+    turbo: { label: "极速", delay: 180 }
+  };
+  const DEFAULT_LOCATE_SPEED = "fast";
   const archive = globalThis.ChatRecallArchive;
   const searchCore = globalThis.ChatRecallCore;
   const exportCore = globalThis.ChatRecallExport;
@@ -25,11 +33,13 @@
     activeView: "search",
     filterStatus: "all",
     lastResults: [],
+    locateSpeed: DEFAULT_LOCATE_SPEED,
     exportDialog: {
       open: false,
       format: "markdown",
       selectedIds: new Set()
     },
+    locate: null,
     capture: null,
     persistChain: Promise.resolve()
   };
@@ -53,6 +63,31 @@
 
   function wait(milliseconds) {
     return new Promise((resolve) => setTimeout(resolve, milliseconds));
+  }
+
+  function currentLocateSpeed() {
+    return LOCATE_SPEEDS[state.locateSpeed] || LOCATE_SPEEDS[DEFAULT_LOCATE_SPEED];
+  }
+
+  async function setLocateSpeed(speedKey) {
+    if (!LOCATE_SPEEDS[speedKey]) return;
+    state.locateSpeed = speedKey;
+    await chrome.storage.local.set({ [LOCATE_SPEED_KEY]: speedKey });
+    if (state.locate) {
+      state.locate.speedKey = speedKey;
+      state.locate.speedLabel = LOCATE_SPEEDS[speedKey].label;
+      state.locate.note = speedKey === "turbo"
+        ? "极速可能导致网页来不及加载，找不到时请切回标准或慢速"
+        : state.locate.note;
+    }
+    renderLocateHud();
+  }
+
+  async function loadLocateSpeed() {
+    const stored = await chrome.storage.local.get(LOCATE_SPEED_KEY);
+    if (LOCATE_SPEEDS[stored[LOCATE_SPEED_KEY]]) {
+      state.locateSpeed = stored[LOCATE_SPEED_KEY];
+    }
   }
 
   function getConversationId(url = location.href) {
@@ -453,6 +488,7 @@
     renderCurrentConversation();
     renderPageStatus();
     renderScanHud();
+    renderLocateHud();
     if (state.activeView === "library") renderLibrary();
     else renderSearch();
   }
@@ -669,8 +705,8 @@
     else container.scrollTo({ top, behavior });
   }
 
-  function scrollElementToCenter(element) {
-    const container = findScrollContainer(element);
+  function scrollElementToCenter(element, preferredContainer = null) {
+    const container = preferredContainer || findScrollContainer(element);
     const targetRect = element.getBoundingClientRect();
     if (isDocumentScroller(container)) {
       const root = document.scrollingElement || document.documentElement;
@@ -687,15 +723,7 @@
     container.scrollTo({ top, behavior: "smooth" });
   }
 
-  async function attemptPendingJump(conversationId) {
-    const stored = await chrome.storage.local.get(PENDING_JUMP_KEY);
-    const pending = stored[PENDING_JUMP_KEY];
-    if (!pending || pending.conversationId !== conversationId) return;
-    if (pending.expiresAt < Date.now()) {
-      await chrome.storage.local.remove(PENDING_JUMP_KEY);
-      return;
-    }
-
+  function findTargetInObserved(pending, conversationId) {
     const observed = extractMessages();
     let targetRecord = pending.stableId
       ? observed.find((item) => item.stableId === pending.stableId)
@@ -712,13 +740,12 @@
         );
       }
     }
-    if (!targetRecord) {
-      showToast("消息已保存在本地，但当前网页尚未加载到该楼层");
-      return;
-    }
+    return { targetRecord, observed };
+  }
 
+  async function highlightLocatedTarget(targetRecord, preferredContainer = null) {
     const turn = targetRecord.node.closest("article") || targetRecord.node;
-    scrollElementToCenter(turn);
+    scrollElementToCenter(turn, preferredContainer);
     const previousOutline = turn.style.outline;
     const previousOffset = turn.style.outlineOffset;
     turn.style.outline = "3px solid rgba(197, 138, 45, .72)";
@@ -729,6 +756,232 @@
     }, 2200);
     await chrome.storage.local.remove(PENDING_JUMP_KEY);
     showToast("已定位到命中消息");
+  }
+
+  function visibleStoredRange(observed, conversation) {
+    const messages = archive.getMessages(conversation);
+    const byStableId = new Map();
+    const bySignature = new Map();
+    messages.forEach((message, index) => {
+      if (message.stableId) byStableId.set(message.stableId, index);
+      const signature = `${message.role}\u241f${archive.normalizeText(message.text)}`;
+      if (!bySignature.has(signature)) bySignature.set(signature, []);
+      bySignature.get(signature).push(index);
+    });
+
+    const indexes = [];
+    for (const item of observed) {
+      let index = item.stableId ? byStableId.get(item.stableId) : undefined;
+      if (!Number.isInteger(index)) {
+        const signature = `${item.role}\u241f${archive.normalizeText(item.text)}`;
+        index = bySignature.get(signature)?.[0];
+      }
+      if (Number.isInteger(index)) indexes.push(index);
+    }
+
+    if (!indexes.length) return null;
+    return {
+      min: Math.min(...indexes),
+      max: Math.max(...indexes),
+      count: indexes.length,
+      total: messages.length
+    };
+  }
+
+  function renderLocateHud() {
+    const locator = state.locate;
+    ui.locateHud.dataset.show = String(Boolean(locator));
+    if (!locator) return;
+    const conversation = state.conversations.get(locator.conversationId);
+    ui.locateTitle.textContent = conversation?.title || "当前对话";
+    ui.locatePhase.textContent = locator.phase || "正在寻找目标消息";
+    ui.locateNote.textContent = locator.note || "会自动滚动并等待网页加载楼层";
+    ui.locateTarget.textContent = `${(locator.targetIndex || 0) + 1} / ${locator.totalCount || "?"}`;
+    ui.locateRange.textContent = locator.visibleRange
+      ? `${locator.visibleRange.min + 1}-${locator.visibleRange.max + 1}`
+      : "识别中";
+    const speed = LOCATE_SPEEDS[locator.speedKey || state.locateSpeed] || currentLocateSpeed();
+    ui.locateSpeed.textContent = `${speed.label} · ${speed.delay}ms`;
+    ui.locateSpeedButtons.forEach((button) => {
+      button.dataset.active = String(button.dataset.locateSpeed === (locator.speedKey || state.locateSpeed));
+    });
+    ui.locateAttempts.textContent = String(locator.attempt || 0);
+    ui.locatePause.hidden = !locator.active;
+    ui.locatePause.textContent = locator.paused ? "继续" : "暂停";
+    ui.locateStop.hidden = !locator.active;
+    ui.locateClose.hidden = locator.active;
+    ui.locateHud.dataset.outcome = locator.outcome || "running";
+  }
+
+  function pauseLocate(reason = "定位已暂停") {
+    if (!state.locate?.active || state.locate.paused) return;
+    state.locate.paused = true;
+    state.locate.phase = "定位已暂停";
+    state.locate.note = reason;
+    renderLocateHud();
+  }
+
+  function resumeLocate() {
+    if (!state.locate?.active || !state.locate.paused) return;
+    state.locate.paused = false;
+    state.locate.phase = "正在继续寻找";
+    state.locate.note = "会继续从当前位置向下查找目标消息";
+    renderLocateHud();
+  }
+
+  function stopLocate() {
+    if (!state.locate?.active) return;
+    state.locate.cancelled = true;
+    state.locate.active = false;
+  }
+
+  async function waitWhileLocatePaused(locator) {
+    while (state.locate === locator && locator.active && locator.paused) await wait(250);
+    return state.locate === locator && locator.active;
+  }
+
+  async function startDynamicLocate(pending) {
+    if (!pending?.conversationId || state.locate?.active) return;
+    const conversation = state.conversations.get(pending.conversationId);
+    const totalCount = conversation ? archive.getMessageCount(conversation) : 0;
+    const firstObserved = extractMessages();
+    const container = findScrollContainer(firstObserved[0]?.node || document.body);
+    const targetIndex = Number.isInteger(pending.messageIndex)
+      ? pending.messageIndex
+      : Math.max(0, archive.getMessages(conversation).findIndex((message) => message.id === pending.messageId));
+
+    state.locate = {
+      active: true,
+      paused: false,
+      cancelled: false,
+      conversationId: pending.conversationId,
+      pending,
+      container,
+      targetIndex: Math.max(0, targetIndex),
+      totalCount,
+      visibleRange: null,
+      direction: null,
+      speedKey: state.locateSpeed,
+      speedLabel: currentLocateSpeed().label,
+      attempt: 0,
+      stagnantCycles: 0,
+      phase: "正在寻找目标消息",
+      note: "会先回到顶部，再向下逐批查找",
+      outcome: null,
+      startedAt: Date.now()
+    };
+    renderLocateHud();
+    runDynamicLocate(state.locate).catch(() => {
+      if (state.locate) {
+        state.locate.active = false;
+        state.locate.outcome = "error";
+        state.locate.phase = "定位发生错误";
+        state.locate.note = "请刷新 ChatGPT 页面后重试";
+        renderLocateHud();
+      }
+    });
+  }
+
+  async function runDynamicLocate(locator) {
+    const maxAttempts = 120;
+    const maxDuration = 90_000;
+    let previousSignature = "";
+    let stagnantCycles = 0;
+
+    locator.phase = "正在回到对话顶部";
+    locator.note = "定位会从顶部向下逐批查找目标消息";
+    locator.speedLabel = currentLocateSpeed().label;
+    renderLocateHud();
+    for (let attempt = 0; attempt < 16; attempt += 1) {
+      if (!await waitWhileLocatePaused(locator)) break;
+      const before = getScrollMetrics(locator.container);
+      setScrollPosition(locator.container, 0, attempt === 0 ? "smooth" : "auto");
+      await wait(650);
+      const after = getScrollMetrics(locator.container);
+      locator.attempt += 1;
+      renderLocateHud();
+      if (after.top <= 4 && Math.abs(after.top - before.top) <= 2) break;
+    }
+
+    while (state.locate === locator && locator.active && locator.attempt < maxAttempts) {
+      if (!await waitWhileLocatePaused(locator)) break;
+      if (Date.now() - locator.startedAt > maxDuration) break;
+
+      const { targetRecord, observed } = findTargetInObserved(locator.pending, locator.conversationId);
+      const conversation = state.conversations.get(locator.conversationId);
+      const range = conversation ? visibleStoredRange(observed, conversation) : null;
+      locator.visibleRange = range;
+      if (targetRecord) {
+        locator.active = false;
+        locator.outcome = "complete";
+        locator.phase = "已找到目标消息";
+        locator.note = "正在居中并高亮";
+        renderLocateHud();
+        await highlightLocatedTarget(targetRecord);
+        await wait(450);
+        if (state.locate === locator) state.locate = null;
+        renderLocateHud();
+        return;
+      }
+
+      const before = getScrollMetrics(locator.container);
+      locator.direction = "down";
+      const speed = currentLocateSpeed();
+      locator.speedKey = state.locateSpeed;
+      locator.speedLabel = speed.label;
+      locator.phase = "正在从顶部向下查找";
+      locator.note = range
+        ? `当前可见区间 ${range.min + 1}-${range.max + 1}，目标第 ${(locator.targetIndex || 0) + 1} 条`
+        : "正在识别当前可见楼层";
+      renderLocateHud();
+
+      const atBottom = before.top + before.height >= before.scrollHeight - 8;
+      if (atBottom) break;
+
+      const step = Math.max(420, Math.floor(before.height * 1.15));
+      setScrollPosition(locator.container, Math.min(before.top + step, before.scrollHeight), "smooth");
+      await wait(speed.delay);
+      locator.attempt += 1;
+
+      const after = getScrollMetrics(locator.container);
+      const signature = `${Math.round(after.top)}:${after.scrollHeight}:${extractMessages().length}`;
+      if (signature === previousSignature || (after.top <= before.top + 2 && after.scrollHeight === before.scrollHeight)) {
+        stagnantCycles += 1;
+      } else {
+        stagnantCycles = 0;
+      }
+      locator.stagnantCycles = stagnantCycles;
+      previousSignature = signature;
+      if (stagnantCycles >= 5) break;
+    }
+
+    if (state.locate !== locator) return;
+    locator.active = false;
+    locator.outcome = locator.cancelled ? "paused" : "incomplete";
+    locator.phase = locator.cancelled ? "定位已停止" : "没有自动找到目标楼层";
+    locator.note = locator.cancelled
+      ? "可以稍后再次点击定位"
+      : "目标仍在本地存档中；可先使用完整扫描补齐网页加载范围";
+    renderLocateHud();
+    if (!locator.cancelled) showToast("没有自动加载到目标楼层，可尝试完整扫描后再定位");
+  }
+
+  async function attemptPendingJump(conversationId) {
+    const stored = await chrome.storage.local.get(PENDING_JUMP_KEY);
+    const pending = stored[PENDING_JUMP_KEY];
+    if (!pending || pending.conversationId !== conversationId) return;
+    if (pending.expiresAt < Date.now()) {
+      await chrome.storage.local.remove(PENDING_JUMP_KEY);
+      return;
+    }
+    if (state.locate?.active && state.locate.conversationId === conversationId) return;
+
+    const { targetRecord } = findTargetInObserved(pending, conversationId);
+    if (targetRecord) {
+      await highlightLocatedTarget(targetRecord);
+      return;
+    }
+    await startDynamicLocate(pending);
   }
 
   function openCaptureConfirm() {
@@ -1168,6 +1421,29 @@
         <button class="cr-hud-close" type="button" hidden>关闭</button>
       </div>
     </aside>
+    <aside class="cr-locate-hud" data-show="false" data-outcome="running" aria-live="polite">
+      <div class="cr-hud-kicker">消息定位</div>
+      <strong class="cr-locate-title">当前对话</strong>
+      <h3 class="cr-locate-phase">正在寻找目标消息</h3>
+      <p class="cr-locate-note">会自动滚动并等待网页加载楼层</p>
+      <dl class="cr-hud-stats">
+        <div><dt>目标位置</dt><dd class="cr-locate-target">0 / 0</dd></div>
+        <div><dt>可见区间</dt><dd class="cr-locate-range">识别中</dd></div>
+        <div><dt>当前速度</dt><dd class="cr-locate-speed">标准</dd></div>
+        <div><dt>尝试次数</dt><dd class="cr-locate-attempts">0</dd></div>
+      </dl>
+      <div class="cr-locate-speed-picker" aria-label="定位滚动速度">
+        <button type="button" data-locate-speed="slow">慢速</button>
+        <button type="button" data-locate-speed="normal">标准</button>
+        <button type="button" data-locate-speed="fast" data-active="true">快速</button>
+        <button type="button" data-locate-speed="turbo">极速</button>
+      </div>
+      <div class="cr-hud-actions">
+        <button class="cr-locate-pause" type="button">暂停</button>
+        <button class="cr-locate-stop" type="button">停止</button>
+        <button class="cr-locate-close" type="button" hidden>关闭</button>
+      </div>
+    </aside>
     <div class="cr-modal cr-capture-confirm" data-show="false">
       <div class="cr-modal-card" role="dialog" aria-modal="true" aria-labelledby="cr-confirm-title">
         <p class="cr-eyebrow">FULL CAPTURE</p>
@@ -1256,6 +1532,18 @@
     hudPause: root.querySelector(".cr-hud-pause"),
     hudStop: root.querySelector(".cr-hud-stop"),
     hudClose: root.querySelector(".cr-hud-close"),
+    locateHud: root.querySelector(".cr-locate-hud"),
+    locateTitle: root.querySelector(".cr-locate-title"),
+    locatePhase: root.querySelector(".cr-locate-phase"),
+    locateNote: root.querySelector(".cr-locate-note"),
+    locateTarget: root.querySelector(".cr-locate-target"),
+    locateRange: root.querySelector(".cr-locate-range"),
+    locateSpeed: root.querySelector(".cr-locate-speed"),
+    locateSpeedButtons: [...root.querySelectorAll(".cr-locate-speed-picker [data-locate-speed]")],
+    locateAttempts: root.querySelector(".cr-locate-attempts"),
+    locatePause: root.querySelector(".cr-locate-pause"),
+    locateStop: root.querySelector(".cr-locate-stop"),
+    locateClose: root.querySelector(".cr-locate-close"),
     captureConfirm: root.querySelector(".cr-capture-confirm"),
     confirmCancel: root.querySelector(".cr-confirm-cancel"),
     confirmStart: root.querySelector(".cr-confirm-start"),
@@ -1321,6 +1609,18 @@
     state.capture = null;
     render();
   });
+  ui.locatePause.addEventListener("click", () => {
+    if (state.locate?.paused) resumeLocate();
+    else pauseLocate("由用户暂停，可随时继续");
+  });
+  ui.locateSpeedButtons.forEach((button) => button.addEventListener("click", () => {
+    setLocateSpeed(button.dataset.locateSpeed).catch(() => showToast("无法保存定位速度设置"));
+  }));
+  ui.locateStop.addEventListener("click", stopLocate);
+  ui.locateClose.addEventListener("click", () => {
+    state.locate = null;
+    renderLocateHud();
+  });
   ui.viewerClose.addEventListener("click", closeLocalPreview);
   ui.viewerLocate.addEventListener("click", () => {
     const conversation = state.conversations.get(ui.viewerLocate.dataset.conversationId);
@@ -1385,21 +1685,38 @@
     ) {
       pauseFullCapture("检测到手动操作，扫描已暂停");
     }
+    if (
+      state.locate?.active &&
+      !state.locate.paused &&
+      event.target !== host &&
+      ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)
+    ) {
+      pauseLocate("检测到手动操作，定位已暂停");
+    }
   }, true);
 
   document.addEventListener("wheel", () => {
     if (state.capture?.active && !state.capture.paused) {
       pauseFullCapture("检测到手动滚动，扫描已暂停");
     }
+    if (state.locate?.active && !state.locate.paused) {
+      pauseLocate("检测到手动滚动，定位已暂停");
+    }
   }, { capture: true, passive: true });
   document.addEventListener("touchstart", () => {
     if (state.capture?.active && !state.capture.paused) {
       pauseFullCapture("检测到触控操作，扫描已暂停");
     }
+    if (state.locate?.active && !state.locate.paused) {
+      pauseLocate("检测到触控操作，定位已暂停");
+    }
   }, { capture: true, passive: true });
   document.addEventListener("visibilitychange", () => {
     if (document.hidden && state.capture?.active && !state.capture.paused) {
       pauseFullCapture("标签页进入后台，扫描已暂停");
+    }
+    if (document.hidden && state.locate?.active && !state.locate.paused) {
+      pauseLocate("标签页进入后台，定位已暂停");
     }
   });
 
@@ -1414,6 +1731,7 @@
   setInterval(() => {
     if (location.href !== lastUrl) {
       if (state.capture?.active) stopFullCapture();
+      if (state.locate?.active) stopLocate();
       lastUrl = location.href;
       state.lastFingerprint = "";
       state.currentConversationId = getConversationId();
@@ -1422,7 +1740,8 @@
     }
   }, 800);
 
-  loadIndex()
+  loadLocateSpeed()
+    .then(loadIndex)
     .then(() => {
       scheduleHarvest();
       setStatus("打开一段对话后便会开始增量收录");
